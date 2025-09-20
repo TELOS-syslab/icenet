@@ -56,6 +56,13 @@ class IPv4Header extends Bundle {
   val ecn = UInt(2.W)
   val version = UInt(4.W)
   val ihl = UInt(4.W)
+}`
+
+object IPv4Header {
+  def apply(words: Seq[UInt], w: Int = NET_IF_WIDTH) = {
+    val headerWords = IPV4_HEAD_BYTES * 8 / w
+    Cat(words.take(headerWords)).asTypeOf(new IPv4Header)
+  }
 }
 
 class UDPHeader extends Bundle {
@@ -63,6 +70,13 @@ class UDPHeader extends Bundle {
   val length = UInt(16.W)
   val dest_port = UInt(16.W)
   val source_port = UInt(16.W)
+}
+
+object UDPHeader {
+  def apply(words: Seq[UInt], w: Int = NET_IF_WIDTH) = {
+    val headerWords = UDP_HEAD_BYTES * 8 / w
+    Cat(words.take(headerWords)).asTypeOf(new UDPHeader)
+  }
 }
 
 class TCPHeader extends Bundle {
@@ -84,4 +98,11 @@ class TCPHeader extends Bundle {
   val seqnum = UInt(32.W)
   val dest_port = UInt(16.W)
   val source_port = UInt(16.W)
+}
+
+object TCPHeader {
+  def apply(words: Seq[UInt], w: Int = NET_IF_WIDTH) = {
+    val headerWords = TCP_HEAD_BYTES * 8 / w
+    Cat(words.take(headerWords)).asTypeOf(new TCPHeader)
+  }
 }

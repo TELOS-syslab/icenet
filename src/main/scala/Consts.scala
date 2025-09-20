@@ -27,6 +27,7 @@ object IceNetConsts {
   val ETH_PAD_BITS = 16
 
   val IPV4_HEAD_BYTES = 20
+  val IPV4_OPTIONAL_MAX_BYTES = 40
   val UDP_HEAD_BYTES = 8
   val TCP_HEAD_BYTES = 20
 

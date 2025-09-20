@@ -428,7 +428,7 @@ class NICIO extends StreamIO(NET_IF_WIDTH) {
  */
 class IceNIC(address: BigInt, beatBytes: Int = 8,
     tapOutFuncs: Seq[EthernetHeader => Bool] = Nil,
-    nInputTaps: Int = 0)
+    nInputTaps: Int = 0, cores: Int = 1)
     (implicit p: Parameters) extends NICLazyModule {
 
   val control = LazyModule(new IceNicController(
