@@ -40,4 +40,5 @@ object IceNetConsts {
 
   val IPV4_ETHTYPE = 0x0008
   val TCP_PROTOCOL = 0x06
+  val UDP_PROTOCOL = 0x11
 }

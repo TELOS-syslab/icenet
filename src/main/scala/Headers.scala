@@ -56,7 +56,7 @@ class IPv4Header extends Bundle {
   val ecn = UInt(2.W)
   val version = UInt(4.W)
   val ihl = UInt(4.W)
-}`
+}
 
 object IPv4Header {
   def apply(words: Seq[UInt], w: Int = NET_IF_WIDTH) = {

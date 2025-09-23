@@ -3,7 +3,7 @@ package icenet
 import chisel3._
 import chisel3.util._
 import chisel3.reflect.DataMirror
-import freechips.rocketchip.subsystem.{BaseSubsystem, TLBusWrapperLocation, PBUS, FBUS}
+import freechips.rocketchip.subsystem.{BaseSubsystem, TLBusWrapperLocation, PBUS, FBUS, InstantiatesHierarchicalElements}
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.prci._
@@ -84,7 +84,11 @@ class IceNicRecvIO extends Bundle {
   val comp = Flipped(Decoupled(UInt(NET_LEN_BITS.W)))
 }
 
-trait IceNicControllerBundle extends Bundle {
+case class IceNicControllerParams(address: BigInt, beatBytes: Int, cores: Int)
+
+class IceNicControllerBundle(cores: Int) extends Bundle {
+  val hash_core = Input(UInt(log2Ceil(cores).W))
+  // TODO(qxh): implement multi-queue here
   val send = new IceNicSendIO
   val recv = new IceNicRecvIO
   val macAddr = Input(UInt(ETH_MAC_BITS.W))
@@ -92,8 +96,6 @@ trait IceNicControllerBundle extends Bundle {
   val rxcsumRes = Flipped(Decoupled(new TCPChecksumOffloadResult))
   val csumEnable = Output(Bool())
 }
-
-case class IceNicControllerParams(address: BigInt, beatBytes: Int)
 
 /*
  * Take commands from the CPU over TL2, expose as Queues
@@ -104,13 +106,16 @@ class IceNicController(c: IceNicControllerParams)(implicit p: Parameters)
     with HasTLControlRegMap
     with HasInterruptSources
     with HasNICParameters {
-  override def nInterrupts = 2
+  def cores: Int = c.cores
+  // TODO(qxh): implement multi-queue here
+  override def nInterrupts = 1 + c.cores
   def tlRegmap(mapping: RegField.Map*): Unit = regmap(mapping:_*)
   override lazy val module = new IceNiCControllerModuleImp(this)
 }
 
 class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters) extends LazyModuleImp(outer) with HasNICParameters {
-  val io = IO(new Bundle with IceNicControllerBundle)
+  val cores = outer.cores
+  val io = IO(new IceNicControllerBundle(cores))
 
   val sendCompDown = WireInit(false.B)
 
@@ -119,6 +124,8 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
 
   def queueCount[T <: Data](qio: QueueIO[T], depth: Int): UInt =
     TwoWayCounter(qio.enq.fire, qio.deq.fire, depth)
+
+  // TODO(qxh): implement multi-queue here
 
   // hold (len, addr) of packets that we need to send out
   val sendReqQueue = Module(new HellaQueue(qDepth)(UInt(NET_IF_WIDTH.W)))
@@ -133,7 +140,7 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   val recvCompCount = queueCount(recvCompQueue.io, qDepth)
 
   val sendCompValid = sendCompCount > 0.U
-  val intMask = RegInit(0.U(2.W))
+  val intMask = RegInit(0.U((1 + cores).W))
 
   io.send.req <> sendReqQueue.io.deq
   io.recv.req <> recvReqQueue.io.deq
@@ -141,7 +148,10 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   recvCompQueue.io.enq <> io.recv.comp
 
   outer.interrupts(0) := sendCompValid && intMask(0)
-  outer.interrupts(1) := recvCompQueue.io.deq.valid && intMask(1)
+  for (i <- 0 until cores) {
+    // TODO(qxh): implement multi-queue here
+    outer.interrupts(1 + i) := i.U === io.hash_core && recvCompQueue.io.deq.valid && intMask(i)
+  }
 
   val sendReqSpace = (qDepth.U - sendReqCount)
   val recvReqSpace = (qDepth.U - recvReqCount)
@@ -176,7 +186,7 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
       RegField.r(8, sendCompCount),
       RegField.r(8, recvCompCount)),
     0x18 -> Seq(RegField.r(ETH_MAC_BITS, io.macAddr)),
-    0x20 -> Seq(RegField(2, intMask)),
+    0x20 -> Seq(RegField(1 + cores, intMask)),
     0x28 -> Seq(RegField.w(49, txcsumReqQueue.io.enq)),
     0x30 -> Seq(RegField.r(2, rxcsumResQueue.io.deq)),
     0x31 -> Seq(RegField(1, csumEnable)))
@@ -290,16 +300,18 @@ class IceNicWriter(implicit p: Parameters) extends NICLazyModule {
 /*
  * Recv frames
  */
-class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil)
+class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil, nCores: Int = 1)
     (implicit p: Parameters) extends LazyModule {
   val writer = LazyModule(new IceNicWriter)
   val node = TLIdentityNode()
   node := writer.node
-  lazy val module = new IceNicRecvPathModule(this)
+  lazy val module = new IceNicRecvPathModule(this, nCores)
 }
 
-class IceNicRecvPathModule(val outer: IceNicRecvPath)
+class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
     extends LazyModuleImp(outer) with HasNICParameters {
+  def usingRSS = nCores > 1
+
   val io = IO(new Bundle {
     val recv = Flipped(new IceNicRecvIO)
     val in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH))) // input stream
@@ -309,6 +321,7 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath)
       val enable = Input(Bool())
     })
     val buf_free = Output(Vec(1 + outer.tapFuncs.length, UInt(8.W)))
+    val hash_core = Output(UInt(log2Ceil(nCores).W))
   })
 
   def tapOutToDropCheck(tapOut: EthernetHeader => Bool) = {
@@ -395,10 +408,22 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath)
 
   val writer = outer.writer.module
   writer.io.recv.req <> Queue(recvreq, 1)
-  io.recv.comp <> writer.io.recv.comp
   writer.io.in <> csumout
   writer.io.length.valid := buflen.valid
   writer.io.length.bits  := buflen.bits
+
+  if (usingRSS) {
+    val rss = Module(new RSS(log2Ceil(nCores)))
+    rss.io.in <> csumout
+    io.hash_core := rss.io.hash_core.bits
+    // completed iff writer is completed and hash is completed
+    io.recv.comp.valid := writer.io.recv.comp.valid && rss.io.hash_core.valid
+    io.recv.comp.bits := writer.io.recv.comp.bits
+    writer.io.recv.comp.ready := io.recv.comp.ready
+  } else {
+    io.recv.comp <> writer.io.recv.comp
+    io.hash_core := 0.U
+  }
 }
 
 class NICIO extends StreamIO(NET_IF_WIDTH) {
@@ -428,13 +453,13 @@ class NICIO extends StreamIO(NET_IF_WIDTH) {
  */
 class IceNIC(address: BigInt, beatBytes: Int = 8,
     tapOutFuncs: Seq[EthernetHeader => Bool] = Nil,
-    nInputTaps: Int = 0, cores: Int = 1)
+    nInputTaps: Int = 0, nCores: Int = 1)
     (implicit p: Parameters) extends NICLazyModule {
 
   val control = LazyModule(new IceNicController(
-    IceNicControllerParams(address, beatBytes)))
+    IceNicControllerParams(address, beatBytes, nCores)))
   val sendPath = LazyModule(new IceNicSendPath(nInputTaps))
-  val recvPath = LazyModule(new IceNicRecvPath(tapOutFuncs))
+  val recvPath = LazyModule(new IceNicRecvPath(tapOutFuncs, nCores))
 
   val mmionode = TLIdentityNode()
   val dmanode = TLIdentityNode()
@@ -454,6 +479,7 @@ class IceNIC(address: BigInt, beatBytes: Int = 8,
 
     sendPath.module.io.send <> control.module.io.send
     recvPath.module.io.recv <> control.module.io.recv
+    control.module.io.hash_core := recvPath.module.io.hash_core
 
     // connect externally
     if (usePauser) {
@@ -546,7 +572,8 @@ object NICIO {
   }
 
 }
-trait CanHavePeripheryIceNIC  { this: BaseSubsystem =>
+trait CanHavePeripheryIceNIC  { this: BaseSubsystem 
+  with InstantiatesHierarchicalElements =>
   private val address = BigInt(0x10016000)
   private val portName = "Ice-NIC"
 
@@ -558,7 +585,7 @@ trait CanHavePeripheryIceNIC  { this: BaseSubsystem =>
     // we assume this is same as the clock domain of the bus the controller masters
     val domain = manager.generateSynchronousDomain.suggestName("icenic_domain")
 
-    val icenic = domain { LazyModule(new IceNIC(address, manager.beatBytes)) }
+    val icenic = domain { LazyModule(new IceNIC(address = address, beatBytes = manager.beatBytes, nCores = nTotalTiles)) }
 
     manager.coupleTo(portName) { icenic.mmionode := TLFragmenter(manager.beatBytes, manager.blockBytes) := _ }
     client.coupleFrom(portName) { _ :=* icenic.dmanode }
