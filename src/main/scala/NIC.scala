@@ -210,7 +210,7 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
      /*
       * multi-queue receive region mapper
       */
-      0x1C -> (1 until nCores).foldLeft(Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(0)))) {(p, k) => 
+      0x20 -> (1 until nCores).foldLeft(Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(0)))) {(p, k) => 
         p ++ Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(k)))},
       0x9C -> (1 until nCores).foldLeft(Seq(RegField.r(NET_LEN_BITS, recvCompDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(NET_LEN_BITS, recvCompDeq(k)))},
