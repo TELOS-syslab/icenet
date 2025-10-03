@@ -212,13 +212,13 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
       */
       0x20 -> (1 until nCores).foldLeft(Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(0)))) {(p, k) => 
         p ++ Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(k)))},
-      0x9C -> (1 until nCores).foldLeft(Seq(RegField.r(NET_LEN_BITS, recvCompDeq(0)))) {(p, k) => 
+      0xA0 -> (1 until nCores).foldLeft(Seq(RegField.r(NET_LEN_BITS, recvCompDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(NET_LEN_BITS, recvCompDeq(k)))},
-      0xBC -> (1 until nCores).foldLeft(Seq(RegField.r(8, recvReqSpace(0)), RegField.r(8, recvCompCount(0)))) {(p, k) => 
+      0xC0 -> (1 until nCores).foldLeft(Seq(RegField.r(8, recvReqSpace(0)), RegField.r(8, recvCompCount(0)))) {(p, k) => 
         p ++ Seq(RegField.r(8, recvReqSpace(k)), 
                  RegField.r(8, recvCompCount(k)))},
-      0xDC -> Seq(RegField(1 + nCores, intMask)),
-      0xDF -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
+      0xE0 -> Seq(RegField(1 + nCores, intMask)),
+      0xE4 -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(2, rxcsumResDeq(k)))},
     )
 }
