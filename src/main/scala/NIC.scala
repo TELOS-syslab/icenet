@@ -165,9 +165,12 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   io.send.comp.ready := sendCompCount < qDepth.U
   recvCompEnq(io.core) <> io.recv.comp
 
+  // TX 中断：有完成项且使能
   outer.interrupts(0) := sendCompValid && intMask(0)
+  // RX 中断（每队列独立线）：只要队列 i 的完成队列非空且使能，即拉高对应中断线
+  // 去掉 i.U === io.core 的门控，避免只有当前 core 对应队列才会触发的限制
   for (i <- 0 until nCores) {
-    outer.interrupts(i + 1) := i.U === io.core && recvCompDeq(i).valid && intMask(i + 1)
+    outer.interrupts(i + 1) := recvCompDeq(i).valid && intMask(i + 1)
   }
 
   val sendReqSpace = (qDepth.U - sendReqCount)
