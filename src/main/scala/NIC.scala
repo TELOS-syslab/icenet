@@ -161,14 +161,21 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   val intMask = RegInit(0.U((1 + nCores).W))
 
   io.send.req <> sendReqQueue.io.deq
-  io.recv.req <> recvReqDeq(io.core)
+  // io.recv.req <> recvReqDeq(io.core)
+  for (i <- 0 until nCores) {
+    recvReqDeq(i).ready := (i.U === io.core) && io.recv.req.ready
+  }
+  io.recv.req.valid := recvReqDeq(io.core).valid
+  io.recv.req.bits := recvReqDeq(io.core).bits
   io.send.comp.ready := sendCompCount < qDepth.U
-  recvCompEnq(io.core) <> io.recv.comp
+  // recvCompEnq(io.core) <> io.recv.comp
+  for (i <- 0 until nCores) {
+    recvCompEnq(i).valid := i.U === io.core && io.recv.comp.valid
+    recvCompEnq(i).bits := io.recv.comp.bits.asUInt
+  }
+  io.recv.comp.ready := recvCompEnq(io.core).ready
 
-  // TX 中断：有完成项且使能
   outer.interrupts(0) := sendCompValid && intMask(0)
-  // RX 中断（每队列独立线）：只要队列 i 的完成队列非空且使能，即拉高对应中断线
-  // 去掉 i.U === io.core 的门控，避免只有当前 core 对应队列才会触发的限制
   for (i <- 0 until nCores) {
     outer.interrupts(i + 1) := recvCompDeq(i).valid && intMask(i + 1)
   }
@@ -195,33 +202,38 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   io.txcsumReq.bits := txcsumReqQueue.io.deq.bits.asTypeOf(new ChecksumRewriteRequest)
   txcsumReqQueue.io.deq.ready := io.txcsumReq.ready
 
-  rxcsumResEnq(io.core).valid := io.rxcsumRes.valid
-  rxcsumResEnq(io.core).bits := io.rxcsumRes.bits.asUInt
+  // rxcsumResEnq(io.core).valid := io.rxcsumRes.valid
+  // rxcsumResEnq(io.core).bits := io.rxcsumRes.bits.asUInt
+  for (i <- 0 until nCores) {
+    rxcsumResEnq(i).valid := i.U === io.core && io.rxcsumRes.valid
+    rxcsumResEnq(i).bits := io.rxcsumRes.bits.asUInt
+  }
   io.rxcsumRes.ready := rxcsumResEnq(io.core).ready
   io.csumEnable := csumEnable
 
     outer.tlRegmap(
       0x00 -> Seq(RegField.w(NET_IF_WIDTH, sendReqQueue.io.enq)),
       0x08 -> Seq(RegField.r(1, sendCompRead)),
-      0x09 -> Seq(
+      0x10 -> Seq(
         RegField.r(8, sendReqSpace),
         RegField.r(8, sendCompCount)),
-      0x0B -> Seq(RegField.r(ETH_MAC_BITS, io.macAddr)),
-      0x13 -> Seq(RegField.w(49, txcsumReqQueue.io.enq)),
-      0x1B -> Seq(RegField(1, csumEnable)),
+      0x18 -> Seq(RegField.r(ETH_MAC_BITS, io.macAddr)),
+      0x20 -> Seq(RegField.w(49, txcsumReqQueue.io.enq)),
+      0x28 -> Seq(RegField(1, csumEnable)),
 
      /*
       * multi-queue receive region mapper
       */
-      0x20 -> (1 until nCores).foldLeft(Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(0)))) {(p, k) => 
+
+      0x30 -> (1 until nCores).foldLeft(Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(0)))) {(p, k) => 
         p ++ Seq(RegField.w(NET_IF_WIDTH, recvReqEnq(k)))},
-      0xA0 -> (1 until nCores).foldLeft(Seq(RegField.r(NET_LEN_BITS, recvCompDeq(0)))) {(p, k) => 
+      0xB0 -> (1 until nCores).foldLeft(Seq(RegField.r(NET_LEN_BITS, recvCompDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(NET_LEN_BITS, recvCompDeq(k)))},
-      0xC0 -> (1 until nCores).foldLeft(Seq(RegField.r(8, recvReqSpace(0)), RegField.r(8, recvCompCount(0)))) {(p, k) => 
+      0xD0 -> (1 until nCores).foldLeft(Seq(RegField.r(8, recvReqSpace(0)), RegField.r(8, recvCompCount(0)))) {(p, k) => 
         p ++ Seq(RegField.r(8, recvReqSpace(k)), 
                  RegField.r(8, recvCompCount(k)))},
-      0xE0 -> Seq(RegField(1 + nCores, intMask)),
-      0xE4 -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
+      0xF0 -> Seq(RegField(1 + nCores, intMask)),
+      0xF4 -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(2, rxcsumResDeq(k)))},
     )
 }
@@ -334,7 +346,7 @@ class IceNicWriter(implicit p: Parameters) extends NICLazyModule {
 /*
  * Recv frames
  */
-class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil, nCores: Int = 1)
+class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil, nCores: Int = 2)
     (implicit p: Parameters) extends LazyModule {
   val writer = LazyModule(new IceNicWriter)
   val node = TLIdentityNode()
@@ -395,6 +407,13 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
     // Drop checks for the tap buffers
     // For each tap, drop if the packet doesn't match the tap function or is a pause frame
     tapDropChecks.map(check => invertCheck(check) +: pauseDropCheck.toSeq)
+  
+  val (core: UInt, hash_valid: Bool) = (if (usingRSS) {
+    val rss = Module(new RSS(log2Ceil(nCores)))
+    rss.io.in.valid := io.in.valid
+    rss.io.in.bits  := io.in.bits
+    (rss.io.hash_core.bits, rss.io.hash_core.valid)
+  } else { (0.U, true.B) })
 
   val buffers = allDropChecks.map(dropChecks =>
     Module(new NetworkPacketBuffer(
@@ -409,11 +428,6 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
   val bufout = buffers.head.io.stream.out
   val buflen = buffers.head.io.length
 
-  val (core: UInt, hash_valid: Bool) = (if (usingRSS) {
-    val rss = Module(new RSS(log2Ceil(nCores)))
-    rss.io.in <> csumout
-    (rss.io.hash_core.bits, rss.io.hash_core.valid)
-  } else { (0.U, true.B) })
   // TODO(qxh): does it lead to incorrect enq_fire for recvReqCount?
 
   val (csumout, recvreq) = (if (checksumOffload) {
@@ -453,15 +467,9 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
   writer.io.length.valid := buflen.valid
   writer.io.length.bits  := buflen.bits
 
-  if (usingRSS) {
-    // completed iff writer is completed and hash is completed
-    io.recv.comp.valid := writer.io.recv.comp.valid && hash_valid
-    io.recv.comp.bits := writer.io.recv.comp.bits
-    writer.io.recv.comp.ready := io.recv.comp.ready
-  } else {
-    io.recv.comp <> writer.io.recv.comp
-  }
-  io.hash_core := core
+  io.recv.comp <> writer.io.recv.comp
+  // if rss isn't ready when packets end, then send the packet to core#0
+  io.hash_core := Mux(hash_valid, core, 0.U)
 }
 
 class NICIO extends StreamIO(NET_IF_WIDTH) {
