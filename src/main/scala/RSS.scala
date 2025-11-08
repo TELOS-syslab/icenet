@@ -26,7 +26,7 @@ class HashIO(nCores: Int) extends Bundle {
  * @nCores Number of cores
  */
 class Hash(hashBits: Int = 32, entries: Int = 16, nCores: Int) extends Module {
-  val io = IO(new HashIO(hashBits))
+  val io = IO(new HashIO(nCores))
 
   private val rss_key = VecInit(Seq(
     0x6d.U(8.W), 0x5a.U(8.W), 0x56.U(8.W), 0xda.U(8.W),
@@ -54,20 +54,8 @@ class Hash(hashBits: Int = 32, entries: Int = 16, nCores: Int) extends Module {
   val hash_array = Cat(io.in.bits.src_ip, io.in.bits.dst_ip, 
     io.in.bits.src_port, io.in.bits.dst_port, io.in.bits.protocol)
   val hash_num = ToeplitzHash(hash_array)
-
-  val next = RegInit(0.U(log2Ceil(nCores).W))
-  val indirection_table = RegInit(VecInit(Seq.fill(entries)(0.U(log2Ceil(nCores).W))))
-  val indirection_flag  = RegInit(VecInit(Seq.fill(entries)(0.U(8.W))))
-  val lsb = hash_num(log2Ceil(entries) + log2Ceil(nCores) - 1, 0)
-  indirection_flag(lsb) := indirection_flag(lsb) + 1.U
-
-  when (io.in.valid) { next := next + 1.U }
-
   io.out.valid := io.in.valid
-  when (indirection_flag(lsb) === 0.U) {
-    indirection_table(lsb) := next
-  }
-  io.out.bits := Mux (indirection_flag(lsb) === 0.U, indirection_table(lsb), next)
+  io.out.bits := hash_num(log2Ceil(entries) - 1, 0)
 }
 
 /**
@@ -83,117 +71,86 @@ class RSS(nCores: Int) extends Module
     val hash_core = Valid(UInt(log2Ceil(nCores).W))
   })
   io.in.ready := true.B
+   
+  class FullTCPHeader extends Bundle {
+    val tcp = new TCPHeader
+    val ipv4 = new IPv4Header
+    val eth = new EthernetHeader
+  }
+  class FullUDPHeader extends Bundle {
+    val align = UInt((TCP_HEAD_BYTES - UDP_HEAD_BYTES).W)
+    val udp = new UDPHeader
+    val ipv4 = new IPv4Header
+    val eth = new EthernetHeader
+  }
+
+  val dataBytes = NET_IF_WIDTH / 8
+
+  // save tcp header only
+  val tcpHeaderBytes = ETH_HEAD_BYTES + IPV4_HEAD_BYTES + TCP_HEAD_BYTES
+  val tcpHeaderWords = tcpHeaderBytes / dataBytes
+  val tcpHeaderSlots = Reg(Vec(tcpHeaderWords, UInt(NET_IF_WIDTH.W)))
+  val tcpHeader = tcpHeaderSlots.asTypeOf(new FullTCPHeader)
+
+  // save udp header only
+  val udpAlign = TCP_HEAD_BYTES - UDP_HEAD_BYTES
+  val udpHeaderBytes = ETH_HEAD_BYTES + IPV4_HEAD_BYTES + UDP_HEAD_BYTES + udpAlign
+  val udpHeaderWords = udpHeaderBytes / dataBytes
+  val udpHeaderSlots = Reg(Vec(udpHeaderWords, UInt(NET_IF_WIDTH.W)))
+  val udpHeader = udpHeaderSlots.asTypeOf(new FullUDPHeader)
+
+  val headerWords = max(tcpHeaderWords, udpHeaderWords)
+  val headerIdx = RegInit(0.U(log2Ceil(headerWords).W))
+
+  require(tcpHeaderBytes % dataBytes == 0)
+  require(udpHeaderBytes % dataBytes == 0)
+
+  val (s_header_in :: s_passthru :: Nil) = Enum(2)
+  val state = RegInit(s_header_in)
+
   /*
    * identify IP address and port number of packets
    */
 
-  // reservation need to save the header until identifying the protocol, ip and port  
-  val resevationBytes = ETH_HEAD_BYTES + IPV4_HEAD_BYTES 
-    + IPV4_OPTIONAL_MAX_BYTES + max(TCP_HEAD_BYTES, UDP_HEAD_BYTES)
-
-  val slots = resevationBytes / NET_IF_BYTES
-  val ethSlots = ETH_HEAD_BYTES / NET_IF_BYTES
-  val ipSlots = IPV4_HEAD_BYTES / NET_IF_BYTES
-  val tcpSlots = TCP_HEAD_BYTES / NET_IF_BYTES
-  val udpSlots = UDP_HEAD_BYTES / NET_IF_BYTES
-
-  // save eth header only
-  val ethReserve = Reg(Vec(slots, UInt(NET_IF_WIDTH.W)))
-  // save ip header only
-  val ipReserve = Reg(Vec(ipSlots, UInt(NET_IF_WIDTH.W)))
-  // save tcp header only
-  val tcpReserve = Reg(Vec(tcpSlots, UInt(NET_IF_WIDTH.W)))
-  // save udp header only
-  val udpReserve = Reg(Vec(udpSlots, UInt(NET_IF_WIDTH.W)))
-
-  val ethHeader = ethReserve.asTypeOf(new EthernetHeader)
-  val ipHeader = ipReserve.asTypeOf(new IPv4Header)
-  val tcpHeader = tcpReserve.asTypeOf(new TCPHeader)
-  val udpHeader = udpReserve.asTypeOf(new UDPHeader)
-
-  val s_head :: s_eth :: s_ip :: s_ip_opt :: s_tail :: Nil = Enum(5)
-  val state = RegInit(s_head)
-
-  val reserveIdx = RegInit(0.U(log2Ceil(slots).W))
-  val preHeader = RegInit(0.U(log2Ceil(slots).W))
-
-  val isIP  = ethHeader.ethType === IPV4_ETHTYPE.U
-  val isTCP = isIP && ipHeader.protocol === TCP_PROTOCOL.U
-  val isUDP = isIP && ipHeader.protocol === UDP_PROTOCOL.U
-
-  val ipv4_header_bytes = ipHeader.ihl
-  val src_ip = ntohl(ipHeader.source_ip)
-  val dst_ip = ntohl(ipHeader.dest_ip)
-  val protocol = ipHeader.protocol // tcp or udp
-  val src_port = Mux(isTCP, tcpHeader.source_port, udpHeader.source_port)
-  val dst_port = Mux(isTCP, tcpHeader.dest_port, udpHeader.dest_port)
-
-  // time to hash when the datagram 1) is not ip, 2) is not tcp or udp
-  val toEnd = (state === s_eth && !isIP) || (state === s_ip && !isTCP && !isUDP) || (state === s_tail)
-
-  val hash = Module(new Hash(hashBits = 32, nCores = nCores))
-  hash.io.in.bits.src_ip := src_ip
-  hash.io.in.bits.dst_ip := dst_ip
-  hash.io.in.bits.src_port := src_port
-  hash.io.in.bits.dst_port := dst_port
-  hash.io.in.bits.protocol := protocol
-  hash.io.in.valid := toEnd
-
-  io.hash_core.valid := hash.io.out.valid
-  io.hash_core.bits := hash.io.out.bits
+  val isIP = tcpHeader.eth.ethType === IPV4_ETHTYPE.U
+  val isTCP = isIP && tcpHeader.ipv4.protocol === TCP_PROTOCOL.U && tcpHeader.ipv4.ihl === 5.U
+  val isUDP = isIP && udpHeader.ipv4.protocol === UDP_PROTOCOL.U && udpHeader.ipv4.ihl === 5.U
+  val src_ip = Mux(isIP, tcpHeader.ipv4.source_ip, 0.U)
+  val dst_ip = Mux(isIP, tcpHeader.ipv4.dest_ip, 0.U)
+  val src_port = Mux(isIP === false.B, 0.U, Mux(isTCP, tcpHeader.tcp.source_port, Mux(isUDP, udpHeader.udp.source_port, 0.U)))
+  val dst_port = Mux(isIP === false.B, 0.U, Mux(isTCP, tcpHeader.tcp.dest_port, Mux(isUDP, udpHeader.udp.dest_port, 0.U)))
 
   /*
    * State Machine
    */
 
   when (io.in.fire) {
-    val data = io.in.bits.data
-
-    switch (state) {
-
-      is (s_head) {
-        ethReserve(reserveIdx) := data
-        reserveIdx := reserveIdx + 1.U
-        when (reserveIdx === (ethSlots - 1).U) { 
-          state := s_eth 
-          preHeader := preHeader + ethSlots.U
-        }
-      }
-
-      is (s_eth) {
-        ipReserve(reserveIdx - preHeader) := data
-        reserveIdx := reserveIdx + 1.U
-        when (reserveIdx === preHeader + IPV4_HEAD_BYTES.U - 1.U) { 
-          state := s_ip 
-          preHeader := preHeader + IPV4_HEAD_BYTES.U
-        }
-      }
-
-      is (s_ip) {
-        reserveIdx := reserveIdx + 1.U
-
-        // TODO(qxh): This may be a bug: what happens when ipv4_header_bytes === IPV4_HEAD_BYTES?
-        when (reserveIdx === preHeader - IPV4_HEAD_BYTES.U + ipv4_header_bytes - 1.U) { 
-          state := s_ip_opt 
-          preHeader := preHeader - IPV4_HEAD_BYTES.U + ipv4_header_bytes
-        }
-      }
-
-      is (s_ip_opt) {
-        reserveIdx := reserveIdx + 1.U
-        tcpReserve(reserveIdx - preHeader) := data
-        udpReserve(reserveIdx - preHeader) := data
-
-        when (reserveIdx === preHeader +
-          Mux(isTCP, TCP_HEAD_BYTES.U, UDP_HEAD_BYTES.U) - 1.U) {
-          state := s_tail
-        }
-      }
-    }
-
     when (io.in.bits.last) {
-      state := s_head
-      reserveIdx := 0.U
+      state := s_header_in
+      headerIdx := 0.U
+    } .elsewhen (state === s_header_in) {
+      when (headerIdx < tcpHeaderBytes.U) { 
+        tcpHeaderSlots(headerIdx) := io.in.bits.data
+      }
+      when (headerIdx < udpHeaderBytes.U) { 
+        udpHeaderSlots(headerIdx) := io.in.bits.data
+      }
+      headerIdx := headerIdx + 1.U
+      when (headerIdx === (headerWords - 1).U) {
+        state := s_passthru
+      }
     }
   }
+
+  val hash = Module(new Hash(hashBits = 32, nCores = nCores))
+  hash.io.in.bits.src_ip := src_ip
+  hash.io.in.bits.dst_ip := dst_ip
+  hash.io.in.bits.src_port := src_port
+  hash.io.in.bits.dst_port := dst_port
+  hash.io.in.bits.protocol := tcpHeader.ipv4.protocol
+  hash.io.in.valid := state === s_passthru
+
+  io.hash_core.valid := hash.io.out.valid
+  io.hash_core.bits := hash.io.out.bits
+
 }
