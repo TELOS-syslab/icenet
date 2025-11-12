@@ -63,7 +63,7 @@ class Hash(hashBits: Int = 32, entries: Int = 16, nCores: Int) extends Module {
  * then implement hash function
  * @nCores Number of cores
  */
-class RSS(nCores: Int) extends Module 
+class RSS(nCores: Int, random: Boolean = false) extends Module 
   with NetworkEndianHelpers {
   val io = IO(new Bundle {
     val in = Flipped(Decoupled(new StreamChannel(NET_IF_WIDTH)))
@@ -112,13 +112,13 @@ class RSS(nCores: Int) extends Module
    * identify IP address and port number of packets
    */
 
-  val isIP = tcpHeader.eth.ethType === IPV4_ETHTYPE.U
-  val isTCP = isIP && tcpHeader.ipv4.protocol === TCP_PROTOCOL.U && tcpHeader.ipv4.ihl === 5.U
-  val isUDP = isIP && udpHeader.ipv4.protocol === UDP_PROTOCOL.U && udpHeader.ipv4.ihl === 5.U
-  val src_ip = Mux(isIP, tcpHeader.ipv4.source_ip, 0.U)
-  val dst_ip = Mux(isIP, tcpHeader.ipv4.dest_ip, 0.U)
-  val src_port = Mux(isIP === false.B, 0.U, Mux(isTCP, tcpHeader.tcp.source_port, Mux(isUDP, udpHeader.udp.source_port, 0.U)))
-  val dst_port = Mux(isIP === false.B, 0.U, Mux(isTCP, tcpHeader.tcp.dest_port, Mux(isUDP, udpHeader.udp.dest_port, 0.U)))
+  val isIP = random.B || tcpHeader.eth.ethType === IPV4_ETHTYPE.U
+  val isTCP = random.B || (isIP && tcpHeader.ipv4.protocol === TCP_PROTOCOL.U && tcpHeader.ipv4.ihl === 5.U)
+  val isUDP = random.B || (isIP && udpHeader.ipv4.protocol === UDP_PROTOCOL.U && udpHeader.ipv4.ihl === 5.U)
+  val src_ip = Mux(isTCP, tcpHeader.ipv4.source_ip, 0.U)
+  val dst_ip = Mux(isTCP, tcpHeader.ipv4.dest_ip, 0.U)
+  val src_port = Mux(isTCP, tcpHeader.tcp.source_port, 0.U)
+  val dst_port = Mux(isTCP, tcpHeader.tcp.dest_port, 0.U)
 
   /*
    * State Machine
