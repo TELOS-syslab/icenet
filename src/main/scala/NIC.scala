@@ -96,6 +96,8 @@ class IceNicControllerBundle(nCores: Int) extends Bundle {
   val txcsumReq = Decoupled(new ChecksumRewriteRequest)
   val rxcsumRes = Flipped(Decoupled(new TCPChecksumOffloadResult))
   val csumEnable = Output(Bool())
+  val lo = Output(Bool())
+  val zero = Output(Bool())
 }
 
 /*
@@ -211,6 +213,11 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   io.rxcsumRes.ready := rxcsumResEnq(io.core).ready
   io.csumEnable := csumEnable
 
+  val lo = RegInit(false.B)
+  io.lo := lo
+  val zero = RegInit(false.B)
+  io.zero := zero
+
     outer.tlRegmap(
       0x00 -> Seq(RegField.w(NET_IF_WIDTH, sendReqQueue.io.enq)),
       0x08 -> Seq(RegField.r(1, sendCompRead)),
@@ -235,6 +242,9 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
       0xF0 -> Seq(RegField(1 + nCores, intMask)),
       0xF4 -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(2, rxcsumResDeq(k)))},
+      
+      0xF8 -> Seq(RegField(1, lo)),
+      0xFA -> Seq(RegField(1, zero)),
     )
 }
 
@@ -346,15 +356,15 @@ class IceNicWriter(implicit p: Parameters) extends NICLazyModule {
 /*
  * Recv frames
  */
-class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil, nCores: Int = 2)
+class IceNicRecvPath(val tapFuncs: Seq[EthernetHeader => Bool] = Nil, nCores: Int = 2, random: Boolean = false)
     (implicit p: Parameters) extends LazyModule {
   val writer = LazyModule(new IceNicWriter)
   val node = TLIdentityNode()
   node := writer.node
-  lazy val module = new IceNicRecvPathModule(this, nCores)
+  lazy val module = new IceNicRecvPathModule(this, nCores, random)
 }
 
-class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
+class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int, random: Boolean)
     extends LazyModuleImp(outer) with HasNICParameters {
   def usingRSS = nCores > 1
 
@@ -368,6 +378,7 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
     })
     val buf_free = Output(Vec(1 + outer.tapFuncs.length, UInt(8.W)))
     val hash_core = Output(UInt(log2Ceil(nCores).W))
+    val zero = Input(Bool())
   })
 
   def tapOutToDropCheck(tapOut: EthernetHeader => Bool) = {
@@ -409,11 +420,18 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
     tapDropChecks.map(check => invertCheck(check) +: pauseDropCheck.toSeq)
   
   val (core: UInt, hash_valid: Bool) = (if (usingRSS) {
-    val rss = Module(new RSS(log2Ceil(nCores)))
+    val rss = Module(new RSS(nCores = nCores, random = random))
     rss.io.in.valid := io.in.valid
     rss.io.in.bits  := io.in.bits
     (rss.io.hash_core.bits, rss.io.hash_core.valid)
   } else { (0.U, true.B) })
+  val hash_core = RegInit(0.U(log2Ceil(nCores).W))
+
+  when (io.zero) {
+    hash_core := 0.U
+  } .elsewhen (hash_valid) {
+    hash_core := core
+  }
 
   val buffers = allDropChecks.map(dropChecks =>
     Module(new NetworkPacketBuffer(
@@ -469,7 +487,7 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int)
 
   io.recv.comp <> writer.io.recv.comp
   // if rss isn't ready when packets end, then send the packet to core#0
-  io.hash_core := Mux(hash_valid, core, 0.U)
+  io.hash_core := hash_core
 }
 
 class NICIO extends StreamIO(NET_IF_WIDTH) {
@@ -524,23 +542,30 @@ class IceNIC(address: BigInt, beatBytes: Int = 8,
       val tapIn = Flipped(Vec(nInputTaps, Decoupled(new StreamChannel(NET_IF_WIDTH))))
     })
     // TODO(qxh): implement multi-send-queue
-
+    val lo = control.module.io.lo
     val hash_core = recvPath.module.io.hash_core
     sendPath.module.io.send <> control.module.io.send
     recvPath.module.io.recv <> control.module.io.recv
     control.module.io.core := recvPath.module.io.hash_core
+    recvPath.module.io.zero := control.module.io.zero
 
     // connect externally
     if (usePauser) {
       val pauser = Module(new Pauser(inBufFlits, 1 + tapOutFuncs.length))
       pauser.io.int.out <> sendPath.module.io.out
       recvPath.module.io.in <> pauser.io.int.in
+      when (lo) {
+        pauser.io.ext.in <> pauser.io.ext.out
+      }
       io.ext.out <> pauser.io.ext.out
       pauser.io.ext.in <> io.ext.in
       pauser.io.in_free := recvPath.module.io.buf_free
       pauser.io.macAddr := io.ext.macAddr
       pauser.io.settings := io.ext.pauser
     } else {
+      when (lo) {
+        recvPath.module.io.in <> sendPath.module.io.out
+      }
       recvPath.module.io.in <> io.ext.in
       io.ext.out <> sendPath.module.io.out
     }
