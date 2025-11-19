@@ -115,10 +115,11 @@ class RSS(nCores: Int, random: Boolean = false) extends Module
   val isIP = random.B || tcpHeader.eth.ethType === IPV4_ETHTYPE.U
   val isTCP = random.B || (isIP && tcpHeader.ipv4.protocol === TCP_PROTOCOL.U && tcpHeader.ipv4.ihl === 5.U)
   val isUDP = random.B || (isIP && udpHeader.ipv4.protocol === UDP_PROTOCOL.U && udpHeader.ipv4.ihl === 5.U)
-  val src_ip = Mux(isTCP, tcpHeader.ipv4.source_ip, 0.U)
-  val dst_ip = Mux(isTCP, tcpHeader.ipv4.dest_ip, 0.U)
-  val src_port = Mux(isTCP, tcpHeader.tcp.source_port, 0.U)
-  val dst_port = Mux(isTCP, tcpHeader.tcp.dest_port, 0.U)
+  val protocol = Mux(isIP, tcpHeader.ipv4.protocol, 0.U)
+  val src_ip = Mux(isIP, tcpHeader.ipv4.source_ip, 0.U)
+  val dst_ip = Mux(isIP, tcpHeader.ipv4.dest_ip, 0.U)
+  val src_port = Mux(isTCP, tcpHeader.tcp.source_port, Mux(isUDP, udpHeader.udp.source_port, 0.U))
+  val dst_port = Mux(isTCP, tcpHeader.tcp.dest_port, Mux(isUDP, udpHeader.udp.dest_port, 0.U))
 
   /*
    * State Machine
@@ -126,6 +127,10 @@ class RSS(nCores: Int, random: Boolean = false) extends Module
 
   when (io.in.fire) {
     when (io.in.bits.last) {
+      when (state === s_header_in) {
+        io.hash_core.valid := true.B
+        io.hash_core.bits := 0.U
+      }
       state := s_header_in
       headerIdx := 0.U
     } .elsewhen (state === s_header_in) {
@@ -147,7 +152,7 @@ class RSS(nCores: Int, random: Boolean = false) extends Module
   hash.io.in.bits.dst_ip := dst_ip
   hash.io.in.bits.src_port := src_port
   hash.io.in.bits.dst_port := dst_port
-  hash.io.in.bits.protocol := tcpHeader.ipv4.protocol
+  hash.io.in.bits.protocol := protocol
   hash.io.in.valid := state === s_passthru
 
   io.hash_core.valid := hash.io.out.valid
