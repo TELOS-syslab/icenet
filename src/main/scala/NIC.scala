@@ -3,7 +3,7 @@ package icenet
 import chisel3._
 import chisel3.util._
 import chisel3.reflect.DataMirror
-import freechips.rocketchip.subsystem.{BaseSubsystem, TLBusWrapperLocation, PBUS, FBUS, InstantiatesHierarchicalElements}
+import freechips.rocketchip.subsystem.{BaseSubsystem, TLBusWrapperLocation, PBUS, FBUS, InstantiatesHierarchicalElements, HasTileNotificationSinks}
 import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.prci._
@@ -11,6 +11,7 @@ import freechips.rocketchip.regmapper._
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
+import freechips.rocketchip.tile._
 import IceNetConsts._
 
 // This is copied from testchipip to avoid dependencies
@@ -57,7 +58,8 @@ trait HasNICParameters {
   val maxAcquireBytes = nicExternal.maxAcquireBytes
   val ctrlQueueDepth = nicExternal.ctrlQueueDepth
   val usePauser = nicExternal.usePauser
-  val checksumOffload = nicExternal.checksumOffload
+  // val checksumOffload = nicExternal.checksumOffload
+  val checksumOffload = false
   val packetMaxBytes = nicExternal.packetMaxBytes
   val nMaxCores = nicExternal.nMaxCores
 }
@@ -89,14 +91,13 @@ class IceNicRecvIO extends Bundle {
 case class IceNicControllerParams(address: BigInt, beatBytes: Int, nCores: Int)
 
 class IceNicControllerBundle(nCores: Int) extends Bundle {
-  val core = Input(UInt(log2Ceil(nCores).W)) // hash result
+  val core = Flipped(Decoupled(UInt(log2Ceil(nCores).W))) // hash result
   val send = new IceNicSendIO
   val recv = new IceNicRecvIO
   val macAddr = Input(UInt(ETH_MAC_BITS.W))
   val txcsumReq = Decoupled(new ChecksumRewriteRequest)
   val rxcsumRes = Flipped(Decoupled(new TCPChecksumOffloadResult))
   val csumEnable = Output(Bool())
-  val lo = Output(Bool())
   val zero = Output(Bool())
 }
 
@@ -119,6 +120,41 @@ class IceNicController(c: IceNicControllerParams)(implicit p: Parameters)
 class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters) extends LazyModuleImp(outer) with HasNICParameters {
   val nCores = outer.nCores
   val io = IO(new IceNicControllerBundle(nCores))
+
+  val (req_start :: req_received :: Nil) = Enum(2)
+  val (comp_start :: comp_received :: comp_waiting :: Nil) = Enum(3)
+  val req_state = RegInit(req_start)
+  val req_core = RegInit(0.U(log2Ceil(nCores).W))
+  val comp_state = RegInit(comp_start)
+  val comp_core = RegInit(0.U(log2Ceil(nCores).W))
+
+  io.core.ready := req_state === req_start
+  
+  val req_to_comp_valid = req_state === req_received
+  val req_to_comp_ready = comp_state === comp_start
+  val req_to_comp_fire = req_to_comp_valid && req_to_comp_ready
+
+  when (req_state === req_start && io.core.fire) {
+    req_state := req_received
+    req_core := io.core.bits
+  }
+
+  when (req_to_comp_fire) {
+    // rss ready
+    comp_core := req_core
+    comp_state := comp_received
+    req_state := req_start
+  }
+
+  when (io.recv.req.fire) {
+    assert(comp_state === comp_received, "Icenet: state error")
+    comp_state := comp_waiting
+  }
+  
+  when (io.recv.comp.fire) {
+    assert(comp_state === comp_waiting, "Icenet: state error")
+    comp_state := comp_start
+  }
 
   require(nCores <= nMaxCores)
   val sendCompDown = WireInit(false.B)
@@ -165,17 +201,17 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   io.send.req <> sendReqQueue.io.deq
   // io.recv.req <> recvReqDeq(io.core)
   for (i <- 0 until nCores) {
-    recvReqDeq(i).ready := (i.U === io.core) && io.recv.req.ready
+    recvReqDeq(i).ready := (i.U === comp_core) && io.recv.req.ready && comp_state === comp_received
   }
-  io.recv.req.valid := recvReqDeq(io.core).valid
-  io.recv.req.bits := recvReqDeq(io.core).bits
+  io.recv.req.valid := recvReqDeq(comp_core).valid && comp_state === comp_received
+  io.recv.req.bits := recvReqDeq(comp_core).bits
   io.send.comp.ready := sendCompCount < qDepth.U
   // recvCompEnq(io.core) <> io.recv.comp
   for (i <- 0 until nCores) {
-    recvCompEnq(i).valid := i.U === io.core && io.recv.comp.valid
+    recvCompEnq(i).valid := i.U === comp_core && io.recv.comp.valid
     recvCompEnq(i).bits := io.recv.comp.bits.asUInt
   }
-  io.recv.comp.ready := recvCompEnq(io.core).ready
+  io.recv.comp.ready := recvCompEnq(comp_core).ready
 
   outer.interrupts(0) := sendCompValid && intMask(0)
   for (i <- 0 until nCores) {
@@ -207,14 +243,12 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
   // rxcsumResEnq(io.core).valid := io.rxcsumRes.valid
   // rxcsumResEnq(io.core).bits := io.rxcsumRes.bits.asUInt
   for (i <- 0 until nCores) {
-    rxcsumResEnq(i).valid := i.U === io.core && io.rxcsumRes.valid
+    rxcsumResEnq(i).valid := i.U === comp_core && io.rxcsumRes.valid
     rxcsumResEnq(i).bits := io.rxcsumRes.bits.asUInt
   }
-  io.rxcsumRes.ready := rxcsumResEnq(io.core).ready
+  io.rxcsumRes.ready := rxcsumResEnq(comp_core).ready
   io.csumEnable := csumEnable
 
-  val lo = RegInit(false.B)
-  io.lo := lo
   val zero = RegInit(false.B)
   io.zero := zero
 
@@ -243,8 +277,7 @@ class IceNiCControllerModuleImp(outer: IceNicController)(implicit p: Parameters)
       0xF4 -> (1 until nCores).foldLeft(Seq(RegField.r(2, rxcsumResDeq(0)))) {(p, k) => 
         p ++ Seq(RegField.r(2, rxcsumResDeq(k)))},
       
-      0xF8 -> Seq(RegField(1, lo)),
-      0xFA -> Seq(RegField(1, zero)),
+      0xF8 -> Seq(RegField(1, zero)),
     )
 }
 
@@ -377,7 +410,7 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int, random: Boole
       val enable = Input(Bool())
     })
     val buf_free = Output(Vec(1 + outer.tapFuncs.length, UInt(8.W)))
-    val hash_core = Output(UInt(log2Ceil(nCores).W))
+    val hash_core = Decoupled(UInt(log2Ceil(nCores).W))
     val zero = Input(Bool())
   })
 
@@ -425,13 +458,6 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int, random: Boole
     rss.io.in.bits  := io.in.bits
     (rss.io.hash_core.bits, rss.io.hash_core.valid)
   } else { (0.U, true.B) })
-  val hash_core = RegInit(0.U(log2Ceil(nCores).W))
-
-  when (io.zero) {
-    hash_core := 0.U
-  } .elsewhen (hash_valid) {
-    hash_core := core
-  }
 
   val buffers = allDropChecks.map(dropChecks =>
     Module(new NetworkPacketBuffer(
@@ -464,7 +490,7 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int, random: Boole
     reqq.io.enq.valid := enqHelper.fire(reqq.io.enq.ready)
     reqq.io.enq.bits := io.recv.req.bits
     io.recv.req.ready := enqHelper.fire(io.recv.req.valid)
-    recvreq.valid := enqHelper.fire(recvreq.ready)
+    recvreq.valid := enqHelper.fire(recvreq.ready, hash_valid)
     recvreq.bits := io.recv.req.bits
 
     out.valid := deqHelper.fire(out.ready)
@@ -487,7 +513,8 @@ class IceNicRecvPathModule(val outer: IceNicRecvPath, nCores: Int, random: Boole
 
   io.recv.comp <> writer.io.recv.comp
   // if rss isn't ready when packets end, then send the packet to core#0
-  io.hash_core := hash_core
+  io.hash_core.bits := Mux(io.zero, 0.U, core)
+  io.hash_core.valid := hash_valid
 }
 
 class NICIO extends StreamIO(NET_IF_WIDTH) {
@@ -529,6 +556,7 @@ class IceNIC(address: BigInt, beatBytes: Int = 8,
   val mmionode = TLIdentityNode()
   val dmanode = TLIdentityNode()
   val intnode = control.intXing(NoCrossing)
+  // val testnode = IntSinkNode(IntSinkPortSimple())
 
   control.node := TLAtomicAutomata() := mmionode
   dmanode := TLWidthWidget(NET_IF_BYTES) := sendPath.node
@@ -542,30 +570,24 @@ class IceNIC(address: BigInt, beatBytes: Int = 8,
       val tapIn = Flipped(Vec(nInputTaps, Decoupled(new StreamChannel(NET_IF_WIDTH))))
     })
     // TODO(qxh): implement multi-send-queue
-    val lo = control.module.io.lo
-    val hash_core = recvPath.module.io.hash_core
     sendPath.module.io.send <> control.module.io.send
     recvPath.module.io.recv <> control.module.io.recv
-    control.module.io.core := recvPath.module.io.hash_core
+    control.module.io.core <> recvPath.module.io.hash_core
     recvPath.module.io.zero := control.module.io.zero
+
+    // val start_test = testnode.in.head._1.asUInt.orR
 
     // connect externally
     if (usePauser) {
       val pauser = Module(new Pauser(inBufFlits, 1 + tapOutFuncs.length))
       pauser.io.int.out <> sendPath.module.io.out
       recvPath.module.io.in <> pauser.io.int.in
-      when (lo) {
-        pauser.io.ext.in <> pauser.io.ext.out
-      }
       io.ext.out <> pauser.io.ext.out
       pauser.io.ext.in <> io.ext.in
       pauser.io.in_free := recvPath.module.io.buf_free
       pauser.io.macAddr := io.ext.macAddr
       pauser.io.settings := io.ext.pauser
     } else {
-      when (lo) {
-        recvPath.module.io.in <> sendPath.module.io.out
-      }
       recvPath.module.io.in <> io.ext.in
       io.ext.out <> sendPath.module.io.out
     }
@@ -647,7 +669,8 @@ object NICIO {
 
 }
 trait CanHavePeripheryIceNIC  { this: BaseSubsystem 
-  with InstantiatesHierarchicalElements =>
+  with InstantiatesHierarchicalElements 
+  with HasTileNotificationSinks =>
   private val address = BigInt(0x10016000)
   private val portName = "Ice-NIC"
 
@@ -658,16 +681,33 @@ trait CanHavePeripheryIceNIC  { this: BaseSubsystem
     // TODO: currently the controller is in the clock domain of the bus which masters it
     // we assume this is same as the clock domain of the bus the controller masters
     val domain = manager.generateSynchronousDomain.suggestName("icenic_domain")
+    // val nicNode = totalTiles.values.map {
+    //   case r: RocketTile => r.nicNode
+    // }.toList.head
+    // val tileNICXbarNode = IntXbar()
+    // val tileNICSinkNode = IntSinkNode(IntSinkPortSimple())
+
+    // assert(nTotalTiles == 1 && tile_prci_domains.size == 1)
+    // val rocket_domain: TilePRCIDomain[RocketTile] = tile_prci_domains.values.toSeq.head.asInstanceOf[TilePRCIDomain[RocketTile]];
+    // val rocket_domain = tile_prci_domains.values.collectFirst {
+    //   case domain: TilePRCIDomain[RocketTile] => domain
+    // }.getOrElse(
+    //   throw new Exception("Expected a RocketTile PRCI domain but none found.")
+    // )
+    // tileNICXbarNode :=* nicNode
+    // tileNICSinkNode := tileNICXbarNode
 
     val icenic = domain { LazyModule(new IceNIC(address = address, beatBytes = manager.beatBytes, nCores = nTotalTiles)) }
 
     manager.coupleTo(portName) { icenic.mmionode := TLFragmenter(manager.beatBytes, manager.blockBytes) := _ }
     client.coupleFrom(portName) { _ :=* icenic.dmanode }
     ibus.fromSync := icenic.intnode
+    // icenic.testnode := tileNICXbarNode
 
     val inner_io = domain { InModuleBody {
       val inner_io = IO(new NICIOvonly).suggestName("nic")
       inner_io <> NICIOvonly(icenic.module.io.ext)
+      // icenic.module.io.start_test := tileNICSinkNode.in.head._1.asUInt.orR
       inner_io
     } }
 
